@@ -79,7 +79,7 @@ Nhận xét: ảnh gấp 50 lần text nên nằm ngoài database (object store,
 - `/follow`: `follow(follower_id, followee_id)`.
 - `/post`: `create(text, images)`, trả về `tweet_id`.
 - `/get/timeline/{user_id}` (user timeline): trả tweet của user đó theo thứ tự thời gian giảm dần, phân trang bằng cursor (không dùng offset), tối đa 600 kết quả (30 page).
-- `/get/timeline` (home timeline): trả tweet của những người mình follow, cùng cách phân trang và giới hạn 600 kết quả.
+- `/get/timeline` (home timeline): trả tweet của những người mình follow, mỗi page 20 tweet, giới hạn 600 kết quả. Cursor là `created_at` của tweet cuối page trước. Mỗi lần gọi lấy tối đa 20 phần tử (có `created_at < cursor`) từ `home_timeline_tweet` của user và từ `influencer_tweets` của từng influencer user đang follow, rồi k-way merge, dừng khi đủ 20 tweet. Kết quả merge chỉ dùng để trả về, không ghi ngược vào NoSQL (sửa so với bản đầu).
 - `/delete`: ngoài phạm vi, bỏ qua.
 
 ### Kiến trúc
@@ -89,8 +89,8 @@ Nhận xét: ảnh gấp 50 lần text nên nằm ngoài database (object store,
 - **Debezium** đọc log của database tweet và publish tweet mới lên message queue.
 - **timeline-service** nhận tweet từ queue, tra bảng follow để tìm follower của tác giả, thêm tweet vào home timeline của từng follower. Home timeline lưu trong NoSQL dạng key-value (ví dụ Redis): `user_id` → danh sách tweet của những người user đó follow.
 - **search-service** nhận tweet từ queue, xử lý rồi lưu vào Elasticsearch.
-- timeline-service, sau khi lưu xong home timeline, tự publish một message lên một queue dạng topic.
-- **notification-service** và **mail-service** subscribe topic đó để gửi push notification và email.
+- User thường: timeline-service, sau khi lưu xong home timeline, tự publish một message lên một queue dạng topic. **notification-service** và **mail-service** subscribe topic đó để gửi push notification và email.
+- Influencer (sửa so với bản đầu): mỗi influencer có một topic riêng, follower subscribe vào topic đó. Khi influencer đăng tweet, publish một notification lên topic của họ, notification-service và mail-service gửi tới các subscriber.
 - **influencer_tweets** (key-value): danh sách tweet của influencer, sắp xếp theo thời gian giảm dần. Xem luồng influencer bên dưới.
 
 ### Dữ liệu
@@ -101,7 +101,7 @@ Nhận xét: ảnh gấp 50 lần text nên nằm ngoài database (object store,
   - `(follower_id)`: trong `/get/timeline`, tìm các followee của user bằng điều kiện `follower_id = user_id`.
 - `influencer_tweets` (key-value): `influencer_id` → danh sách tweet của influencer đó, sắp xếp theo thời gian giảm dần. Giới hạn số phần tử chưa chốt, ứng viên định giới hạn theo thời gian (giữ 5 hoặc 10 ngày).
 - Số liệu interviewer cung cấp: influencer đăng trung bình 10 tweet/ngày, ngày cao điểm tới 50 tweet/ngày. Khoảng 0,1% user là influencer (khoảng 100.000 người).
-- `tweet(id, user_id, text, image_url, created_at)`, có index theo `user_id`.
+- `tweet(id, user_id, text, image_url, created_at)`, có index `(user_id, created_at)` (sửa so với bản đầu chỉ có `user_id`): user timeline đọc thẳng theo index, không phải sort.
 - Home timeline (NoSQL key-value, ví dụ Redis): `user_id` → danh sách tweet theo thời gian giảm dần, tối đa 600 mục. Ứng viên tính 100 triệu user × 600 × 1 KB = 60 TB nếu mỗi mục là một tweet đầy đủ 1 KB.
 
 ### Luồng xử lý
@@ -111,13 +111,25 @@ Nhận xét: ảnh gấp 50 lần text nên nằm ngoài database (object store,
   - User thường: trả về danh sách follower, thêm tweet vào home timeline của từng follower.
   - Influencer: trả về danh sách follower rỗng (không fanout), thêm tweet vào `influencer_tweets`.
 - **User timeline:** truy vấn bảng tweet theo `user_id` bằng index, sắp xếp theo thời gian giảm dần, phân trang bằng cursor.
-- **Home timeline:** query các followee của user, lấy ra những followee là influencer, merge `influencer_tweets` của họ vào home timeline của user trong NoSQL, rồi lưu danh sách đã merge làm home timeline mới của user. Giới hạn 600 mục. Ảnh hưởng tới latency p99 < 200 ms: ứng viên sẽ xử lý ở phần phi chức năng.
+- **Home timeline:** query các followee của user, lấy ra những followee là influencer. Với `home_timeline_tweet` của user và `influencer_tweets` của từng influencer đó, lấy 20 phần tử có `created_at < cursor`, k-way merge, dừng khi đủ 20. Trả về, không ghi lại. Giới hạn 600 mục. Ảnh hưởng tới latency p99 < 200 ms: ứng viên sẽ xử lý ở phần phi chức năng.
 
 ### Vấn đề ứng viên đã nêu, chưa giải quyết
 
 - (a) Sinh `tweet_id` không trùng khi có nhiều instance (6.000 tweet/s).
 - (b) Một database không chứa hết tweet, cần partition/sharding. (a) và (b) bàn ở phần phi chức năng.
 - (c) Xử lý ở timeline-service cho user có nhiều follower: đã có thiết kế (cờ `is_influencer`, `influencer_tweets`, merge khi đọc). Còn mở: giới hạn của `influencer_tweets`.
+
+### Nhận xét của interviewer sau khi ứng viên sửa thiết kế
+
+Bản đầu có ba lỗi: đường đọc có ghi (read-modify-write gây race với fanout), merge lặp lại gây trùng tweet, notification của influencer rỗng. Bản sửa:
+
+- **Đã giải quyết:** k-way merge không ghi ngược, hết race và hết trùng. Index `(user_id, created_at)` đúng hướng.
+- **Còn hở ở home timeline:**
+  1. Cursor chỉ có `created_at`: hai tweet cùng timestamp (nhất là từ nhiều user khác nhau) có thể bị bỏ sót hoặc lặp ở ranh giới page. Cần cursor dạng `(created_at, tweet_id)` hoặc ID sắp xếp được theo thời gian.
+  2. "Lấy 20 phần tử có `created_at < cursor`" cần cấu trúc có truy vấn theo khoảng. Redis list không làm được điều này, sorted set (score = thời gian) thì được. Cần chốt cấu trúc dữ liệu.
+  3. Đường đọc vẫn cần danh sách influencer mà user follow (hiện là query SQL theo `follower_id`), và số list cần đọc là k. Chưa ước lượng k, chưa tính số lệnh Redis/s ở 500.000 đọc/s, và `influencer_tweets` của influencer nổi tiếng là hot key.
+  4. Chưa nói mục home timeline là tweet đầy đủ hay chỉ `tweet_id` (cần thêm bước lấy nội dung).
+- **Notification cho influencer:** "subscribe topic" chuyển bài toán fanout sang notification-service chứ không làm nó biến mất. Chưa rõ subscribe có khác follow không, tức là có opt-in không (xem câu hỏi vòng 2). Luồng user thường vẫn phụ thuộc timeline-service xong mới notify.
 
 ## 4. Câu hỏi cần tự trả lời
 
